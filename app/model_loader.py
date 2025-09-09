@@ -106,9 +106,52 @@ class ChatModel:
                 self.tokenizer = AutoTokenizer.from_pretrained(candidate, use_fast=True)
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    candidate, torch_dtype="auto", **load_kwargs
-                )
+                # --- DType selection ---
+                # Avoid accidental bfloat16 on GPUs (e.g., V100) that don't support it well.
+                env_dtype = os.getenv("MODEL_DTYPE", "").lower().strip()
+                resolved_dtype = None
+                if env_dtype:
+                    try:
+                        if env_dtype in ("fp16", "float16", "half"):
+                            resolved_dtype = torch.float16
+                        elif env_dtype in ("fp32", "float32"):
+                            resolved_dtype = torch.float32
+                        elif env_dtype in ("bf16", "bfloat16"):
+                            resolved_dtype = torch.bfloat16
+                        else:
+                            logger.warning(f"Unknown MODEL_DTYPE '{env_dtype}', falling back to heuristic")
+                    except Exception:  # noqa: BLE001
+                        pass
+                if resolved_dtype is None:
+                    if torch.cuda.is_available():
+                        # Prefer float16 on pre-Ampere (no native bfloat16) to avoid matmul dtype mismatches.
+                        cap_major = torch.cuda.get_device_capability()[0]
+                        if cap_major < 8:  # < Ampere
+                            resolved_dtype = torch.float16
+                        else:
+                            resolved_dtype = torch.bfloat16
+                    else:
+                        resolved_dtype = torch.float32
+
+                load_try_dtypes: List[torch.dtype] = [resolved_dtype]
+                # As safety net, append float32 if not already there.
+                if torch.float32 not in load_try_dtypes:
+                    load_try_dtypes.append(torch.float32)
+
+                last_load_exc = None
+                for dt in load_try_dtypes:
+                    try:
+                        logger.info(f"Loading model with torch_dtype={dt}")
+                        self.model = AutoModelForCausalLM.from_pretrained(
+                            candidate, torch_dtype=dt, **load_kwargs
+                        )
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        last_load_exc = e
+                        logger.warning(f"Load attempt with dtype {dt} failed: {e}")
+                        self.model = None
+                if self.model is None:
+                    raise last_load_exc or RuntimeError("Model load failed for unknown reasons")
                 chosen_name = candidate
                 break
             except Exception as e:  # noqa: BLE001
@@ -131,6 +174,7 @@ class ChatModel:
             "model_name": chosen_name,
             "device": str(next(self.model.parameters()).device),
             "dtype": str(dtype),
+            "forced_dtype_env": os.getenv("MODEL_DTYPE") or None,
             "quantization": "4bit" if quantize == "4" else None,
             "requested": requested,
         }

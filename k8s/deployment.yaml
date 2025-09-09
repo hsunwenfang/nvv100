@@ -35,6 +35,8 @@ spec:
               value: "hf"
             - name: MODEL_NAME
               value: "mistral"
+            - name: MODEL_DTYPE
+              value: "fp16"
             - name: MAX_NEW_TOKENS
               value: "128"
             - name: ACCEPT_GATED
