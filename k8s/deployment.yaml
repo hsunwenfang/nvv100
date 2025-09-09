@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-app
+  namespace: chat
+  labels:
+    app: chat-app
+  annotations:
+    rollout.gpu/strategy: "recreate"
+spec:
+  strategy:
+    type: Recreate
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-app
+  template:
+    metadata:
+      labels:
+        app: chat-app
+      annotations:
+        rollout.gpu/ts: "1"
+    spec:
+      containers:
+        - name: chat-app
+          image: chat-app:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: hf-token
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MODEL_SOURCE
+              value: "hf"
+            - name: MODEL_NAME
+              value: "mistral"
+            - name: MAX_NEW_TOKENS
+              value: "128"
+            - name: ACCEPT_GATED
+              value: "1"
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+            - name: TOKENIZERS_PARALLELISM
+              value: "false"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+          resources:
+            limits:
+              nvidia.com/gpu: 1
