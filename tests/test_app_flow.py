@@ -40,8 +40,8 @@ def test_chat_profile_creates_trace():
     assert r.status_code == 200, r.text
     data = r.json()
     trace_path = data.get("profile_trace")
-    assert trace_path and trace_path.endswith(".json")
-    assert Path(trace_path).is_file()
-    # At least one trace file present
-    files = glob.glob("profiles/torch/trace_*.json")
+    assert trace_path and (trace_path.endswith(".json") or trace_path.endswith(".json.gz"))
+    assert Path(trace_path).is_file(), f"Trace file not found: {trace_path}"
+    # At least one trace file present (.json or .json.gz)
+    files = glob.glob("profiles/torch/trace_*.json") + glob.glob("profiles/torch/trace_*.json.gz")
     assert files, "No trace files found"

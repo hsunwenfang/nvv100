@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-# transfer_profile.sh - Fetch a profiler trace from the running chat pod and copy it to a remote machine.
+# transfer_profile.sh - List all profiler gz traces in the newest running chat pod and copy the latest one locally.
+#
+# Simplified per requirements:
+#   * Always auto-detect the latest (newest creationTimestamp) Running pod with label app=chat-app
+#   * Print all *.json.gz trace files with modification times inside the pod
+#   * Always copy the newest (most recently modified) trace_*.json.gz to local directory
+#   * Removed all scp / remote transfer logic
 #
 # Usage:
-#   ./scripts/transfer_profile.sh <pod|auto> <trace_filename|latest> <remote_spec> [remote_filename]
-#
-# Arguments:
-#   pod             : Explicit pod name (e.g. chat-app-5fb6b68db5-pd7ld) or 'auto' to pick the first Ready pod with label app=chat-app
-#   trace_filename  : Exact file name (e.g. trace_20250910T031735444503.json.gz) OR 'latest' to auto-detect newest trace in pod
-#   remote_spec     : scp destination in standard form user@host:/absolute/path/or/dir
-#   remote_filename : (optional) Override the destination file name (default keeps original)
+#   ./scripts/transfer_profile.sh
 #
 # Environment overrides:
-#   NAMESPACE       : Kubernetes namespace (default: chat)
-#   LOCAL_DIR       : Local directory to place copied traces (default: profiles/torch)
-#   TRACE_DIR_IN_POD: Directory inside pod (default: /app/profiles/torch)
-#   DECOMPRESS      : If set to 1, also produce an uncompressed JSON copy locally
-#   DRY_RUN         : If set to 1, print commands without executing network actions
-#
-# Examples:
-#   ./scripts/transfer_profile.sh auto latest user@167.220.232.22:/Users/hsunwenfang/Documents/nv-playground
-#   ./scripts/transfer_profile.sh chat-app-5fb6b68db5-pd7ld trace_20250910T031735444503.json.gz user@167.220.232.22:/Users/me/traces custom_name.json.gz
+#   NAMESPACE        : Kubernetes namespace (default: chat)
+#   LOCAL_DIR        : Local directory to place copied traces (default: profiles/torch)
+#   TRACE_DIR_IN_POD : Directory inside pod (default: /app/profiles/torch)
+#   DECOMPRESS       : If set to 1, also keep an uncompressed JSON copy
+#   DRY_RUN          : If set to 1, show what would happen without copying
 #
 set -euo pipefail
 
@@ -33,56 +29,41 @@ err() { echo "[transfer_profile] ERROR: $*" >&2; exit 1; }
 log() { echo "[transfer_profile] $*" >&2; }
 
 command -v kubectl >/dev/null 2>&1 || err "kubectl not found in PATH"
-command -v scp >/dev/null 2>&1 || log "scp not found (will fail if remote transfer attempted)"
 
-if [[ $# -lt 3 || $# -gt 4 ]]; then
-  err "Usage: $0 <pod|auto> <trace_filename|latest> <remote_spec> [remote_filename]"
+if [[ $# -ne 0 ]]; then
+  err "No arguments accepted. Use environment variables if needed."
 fi
 
-POD_INPUT=$1
-TRACE_INPUT=$2
-REMOTE_SPEC=$3
-REMOTE_FILENAME=${4:-}
+# Find newest running pod (by creationTimestamp) with label app=chat-app
+POD=$(kubectl -n "${NAMESPACE}" get pods -l app=chat-app -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.creationTimestamp}{" "}{.metadata.name}{"\n"}{end}' | sort | tail -n1 | awk '{print $2}')
+[[ -z ${POD} ]] && err "No Running pods with label app=chat-app in namespace ${NAMESPACE}"
 
-# Resolve pod
-if [[ ${POD_INPUT} == "auto" ]]; then
-  POD=$(kubectl -n "${NAMESPACE}" get pods -l app=chat-app -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' | head -n1)
-  [[ -z ${POD} ]] && err "No running pod with label app=chat-app found in namespace ${NAMESPACE}"
-else
-  POD=${POD_INPUT}
-fi
+log "Selected newest running pod: ${POD}"
 
-# Verify pod exists
-kubectl -n "${NAMESPACE}" get pod "${POD}" >/dev/null 2>&1 || err "Pod ${POD} not found in namespace ${NAMESPACE}"
+# List all gz trace files with modification time
+log "Listing trace *.json.gz files (if any) in ${POD}:${TRACE_DIR_IN_POD}" 
+LIST_CMD=(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -ltr ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null || true")
+${LIST_CMD[@]} >&2 || true
 
-# Determine trace filename
-if [[ ${TRACE_INPUT} == "latest" ]]; then
-  TRACE_FILE=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n1") || true
-  [[ -z ${TRACE_FILE} ]] && err "No trace_*.json.gz files found in pod ${POD}"
-  # Extract just the basename
-  TRACE_BASENAME=$(basename "${TRACE_FILE}")
-else
-  TRACE_BASENAME=${TRACE_INPUT}
-  TRACE_FILE="${TRACE_DIR_IN_POD}/${TRACE_BASENAME}"
-fi
+# Determine newest (most recently modified) trace file path
+TRACE_FILE=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n1") || true
+[[ -z ${TRACE_FILE} ]] && err "No trace_*.json.gz files found in pod ${POD}"
+TRACE_BASENAME=$(basename "${TRACE_FILE}")
 
-# Local target
 mkdir -p "${LOCAL_DIR}"
 LOCAL_PATH="${LOCAL_DIR}/${TRACE_BASENAME}"
 
-log "Pod: ${POD}"
-log "Trace file in pod: ${TRACE_FILE}"
-log "Local destination: ${LOCAL_PATH}"
+log "Latest trace file: ${TRACE_FILE}"
+log "Copying to: ${LOCAL_PATH}"
 
-KCP_CMD=(kubectl -n "${NAMESPACE}" cp "${POD}:${TRACE_FILE}" "${LOCAL_PATH}")
-log "Running: ${KCP_CMD[*]}"
 if [[ ${DRY_RUN} != 1 ]]; then
-  "${KCP_CMD[@]}"
+  kubectl -n "${NAMESPACE}" cp "${POD}:${TRACE_FILE}" "${LOCAL_PATH}" || err "kubectl cp failed"
+else
+  log "DRY_RUN=1; skipping copy"
+  exit 0
 fi
 
-if [[ ! -s ${LOCAL_PATH} ]]; then
-  err "File copy failed or empty: ${LOCAL_PATH}"
-fi
+[[ ! -s ${LOCAL_PATH} ]] && err "Local file missing or empty after copy: ${LOCAL_PATH}"
 
 if [[ ${DECOMPRESS} == 1 ]]; then
   if command -v gunzip >/dev/null 2>&1; then
@@ -93,44 +74,5 @@ if [[ ${DECOMPRESS} == 1 ]]; then
   fi
 fi
 
-# Remote destination logic
-if [[ -n ${REMOTE_FILENAME} ]]; then
-  REMOTE_TARGET="${REMOTE_SPEC%/}/${REMOTE_FILENAME}"
-else
-  # If REMOTE_SPEC ends with '/', treat as directory
-  if [[ ${REMOTE_SPEC} == */ ]]; then
-    REMOTE_TARGET="${REMOTE_SPEC}${TRACE_BASENAME}"
-  else
-    # If it looks like user@host:/path
-    if [[ ${REMOTE_SPEC} == *:* ]]; then
-      # Determine if remote part ends with .gz or .json
-      REMOTE_PATH_PART=${REMOTE_SPEC#*:}
-      if [[ ${REMOTE_PATH_PART} == */ ]]; then
-        REMOTE_TARGET="${REMOTE_SPEC}${TRACE_BASENAME}"
-      else
-        # Provided a full path including filename
-        REMOTE_TARGET="${REMOTE_SPEC}"
-      fi
-    else
-      # Assume directory path without user@host prefix
-      REMOTE_TARGET="${REMOTE_SPEC%/}/${TRACE_BASENAME}"
-    fi
-  fi
-fi
-
-log "Remote target: ${REMOTE_TARGET}"
-
-if [[ ${DRY_RUN} == 1 ]]; then
-  log "DRY_RUN=1; skipping scp"
-  exit 0
-fi
-
-# Perform scp
-if command -v scp >/dev/null 2>&1; then
-  log "Transferring via scp..."
-  scp -p "${LOCAL_PATH}" "${REMOTE_TARGET}" || err "scp transfer failed"
-  log "Transfer complete: ${REMOTE_TARGET}"
-else
-  err "scp command not available"
-fi
+log "Done."
 

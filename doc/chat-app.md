@@ -7,9 +7,11 @@ Content-Type: application/json
 ```
 
 ```http
-POST /chat HTTP/1.1
+POST /chat
 Host: localhost:8080
 Content-Type: application/json
 
-{"message":"Found me 100000 vegan restaurants in Tokyo and write recommendation messages about them"}
+{
+    "message":"What Rakuten sells"
+}
 ```

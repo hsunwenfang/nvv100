@@ -102,25 +102,54 @@ else
   echo "Minikube already running. Skipping start.";
   if (( ! FRESH )); then
     echo "Checking existing cluster GPU readiness (device, plugin pod, resource)..."
+    # New logic: be less destructive. Only restart if the GPU device itself is missing.
+    # Env toggles:
+    #   GPU_READINESS_STRICT=1   -> revert to old behaviour (restart if not fully ready)
+    #   GPU_VERSION_FALLBACK=1   -> later section may delete & retry different K8s versions
+    GPU_READINESS_STRICT=${GPU_READINESS_STRICT:-0}
     attempts=0
-    max_attempts=25   # ~100s (25 * 4s) graceful wait before deciding restart
+    max_attempts=45   # ~180s (45 * 4s) total gentle wait
     while :; do
       GPU_DEVICE_OK=0; PLUGIN_OK=0; RESOURCE_OK=0
       if minikube ssh -p "${MINIKUBE_PROFILE}" -- 'ls /dev/nvidia0 >/dev/null 2>&1'; then GPU_DEVICE_OK=1; fi
       if kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running; then PLUGIN_OK=1; fi
+      # Extra heuristic: some installations use 'nvidia-device-plugin-daemonset'
+      if (( PLUGIN_OK == 0 )); then
+        if kubectl get pods -n kube-system 2>/dev/null | grep -E 'nvidia-device-plugin' | grep -q Running; then PLUGIN_OK=1; fi
+      fi
       if kubectl describe node ${MINIKUBE_PROFILE} 2>/dev/null | grep -q 'nvidia.com/gpu'; then RESOURCE_OK=1; fi
       if (( GPU_DEVICE_OK && PLUGIN_OK && RESOURCE_OK )); then
         echo "Cluster already GPU ready; no restart needed."; break
       fi
       if (( attempts >= max_attempts )); then
-        echo "Existing cluster NOT fully GPU ready after wait (device:${GPU_DEVICE_OK} plugin:${PLUGIN_OK} resource:${RESOURCE_OK}). Restarting..." >&2
-        minikube delete -p "${MINIKUBE_PROFILE}" || true
-        echo "Starting Minikube with GPU flags: ${START_FLAGS}" 
-        if ! minikube start -p "${MINIKUBE_PROFILE}" ${START_FLAGS}; then
-          echo "ERROR: minikube start failed after restart attempt." >&2
-          exit 1
+        if (( GPU_DEVICE_OK == 0 )); then
+          echo "GPU device /dev/nvidia0 still missing after ${max_attempts} attempts; restarting cluster (hard failure)." >&2
+          minikube delete -p "${MINIKUBE_PROFILE}" || true
+          echo "Starting Minikube with GPU flags: ${START_FLAGS}"
+          if ! minikube start -p "${MINIKUBE_PROFILE}" ${START_FLAGS}; then
+            echo "ERROR: minikube start failed after restart attempt." >&2
+            exit 1
+          fi
+        else
+          if (( GPU_READINESS_STRICT )); then
+            echo "Not fully ready (plugin:${PLUGIN_OK} resource:${RESOURCE_OK}) and GPU_READINESS_STRICT=1 -> restarting." >&2
+            minikube delete -p "${MINIKUBE_PROFILE}" || true
+            if ! minikube start -p "${MINIKUBE_PROFILE}" ${START_FLAGS}; then
+              echo "ERROR: minikube start failed after strict restart." >&2
+              exit 1
+            fi
+          else
+            echo "Proceeding even though not fully ready yet (plugin:${PLUGIN_OK} resource:${RESOURCE_OK}); later steps will wait. Set GPU_READINESS_STRICT=1 to enforce restart." >&2
+            if (( PLUGIN_OK == 0 )); then
+              echo "DEBUG: Device plugin not yet detected; current kube-system NVIDIA pods:" >&2
+              kubectl get pods -n kube-system 2>/dev/null | grep -i nvidia || true
+            fi
+          fi
         fi
         break
+      fi
+      if (( attempts % 5 == 0 )); then
+        echo "Still waiting (attempt ${attempts}/${max_attempts}) device:${GPU_DEVICE_OK} plugin:${PLUGIN_OK} resource:${RESOURCE_OK}" >&2
       fi
       attempts=$((attempts+1))
       sleep 4
@@ -169,18 +198,27 @@ else
   PLUGIN_NAMESPACE=""  # default namespace
 fi
 
-echo "Waiting for any NVIDIA device plugin pod to be Running..."
+echo "Waiting for NVIDIA device plugin pod to be Running (robust matching)..."
+device_plugin_ready() {
+  # Match any of several common label patterns OR fallback to name substring scan.
+  if kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running; then return 0; fi
+  if kubectl get pods -A -l name=nvidia-device-plugin-ds 2>/dev/null | grep -q Running; then return 0; fi
+  if kubectl get pods -n kube-system 2>/dev/null | grep -E 'nvidia-device-plugin' | grep -q Running; then return 0; fi
+  return 1
+}
 for i in {1..45}; do
-  if kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running || \
-     kubectl get pods -A -l name=nvidia-device-plugin-ds 2>/dev/null | grep -q Running; then
+  if device_plugin_ready; then
     echo "Device plugin detected running."; break
+  fi
+  if (( i % 5 == 0 )); then
+    echo "(attempt $i) still waiting for device plugin; current matching pods:" >&2
+    kubectl get pods -n kube-system 2>/dev/null | grep -i nvidia || true
   fi
   sleep 4
 done
-if ! (kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running || \
-      kubectl get pods -A -l name=nvidia-device-plugin-ds 2>/dev/null | grep -q Running); then
-  echo "ERROR: No running NVIDIA device plugin pod after wait." >&2
-  kubectl get pods -A | grep -i nvidia || true
+if ! device_plugin_ready; then
+  echo "ERROR: No running NVIDIA device plugin pod after wait (tried multiple matching strategies)." >&2
+  kubectl get pods -n kube-system 2>/dev/null | grep -i nvidia || kubectl get pods -A | grep -i nvidia || true
   exit 1
 fi
 
@@ -194,30 +232,45 @@ fi
 
 echo "[4/6] Validating node advertises nvidia.com/gpu..."
 if ! kubectl describe node ${MINIKUBE_PROFILE} | grep -q 'nvidia.com/gpu'; then
-  echo "WARNING: Node does not advertise nvidia.com/gpu yet." >&2
-  echo "Attempting fallback Kubernetes versions..." >&2
-  FALLBACK_VERSIONS=${GPU_RETRY_VERSIONS:-"v1.30.2 v1.29.6"}
-  for ver in $FALLBACK_VERSIONS; do
-    echo "--- Fallback attempt with Kubernetes ${ver} ---" >&2
-    echo "Deleting cluster..." >&2
-    minikube delete -p "${MINIKUBE_PROFILE}" >/dev/null 2>&1 || true
-    echo "Starting Minikube (Kubernetes ${ver}) with GPU flags..." >&2
-    if ! minikube start -p "${MINIKUBE_PROFILE}" --driver=docker --container-runtime=docker --gpus=all --kubernetes-version=${ver} --addons=nvidia-device-plugin --extra-config=kubelet.cgroup-driver=${HOST_CGROUP_DRIVER}; then
-      echo "Start failed for ${ver}; trying next if available." >&2
-      continue
-    fi
-    echo "Waiting briefly for device plugin pods..." >&2
-    for i in {1..20}; do
-      if kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running; then break; fi
-      sleep 4
-    done
-    if kubectl describe node ${MINIKUBE_PROFILE} | grep -q 'nvidia.com/gpu'; then
-      echo "SUCCESS: GPU resource visible on ${ver}." >&2
+  echo "WARNING: Node does not advertise nvidia.com/gpu yet (may take time after plugin starts)." >&2
+  echo "Waiting up to 300s for resource advertisement..." >&2
+  for i in {1..60}; do
+    if kubectl describe node ${MINIKUBE_PROFILE} 2>/dev/null | grep -q 'nvidia.com/gpu'; then
+      echo "GPU resource appeared after wait (${i} *5s)." >&2
       break
-    else
-      echo "GPU still not visible on ${ver}." >&2
     fi
+    sleep 5
   done
+  if ! kubectl describe node ${MINIKUBE_PROFILE} | grep -q 'nvidia.com/gpu'; then
+    GPU_VERSION_FALLBACK=${GPU_VERSION_FALLBACK:-0}
+    if (( GPU_VERSION_FALLBACK )); then
+      echo "Resource still absent; GPU_VERSION_FALLBACK=1 -> attempting alternate Kubernetes versions." >&2
+      FALLBACK_VERSIONS=${GPU_RETRY_VERSIONS:-"v1.30.2 v1.29.6"}
+      for ver in $FALLBACK_VERSIONS; do
+        echo "--- Fallback attempt with Kubernetes ${ver} ---" >&2
+        echo "Deleting cluster..." >&2
+        minikube delete -p "${MINIKUBE_PROFILE}" >/dev/null 2>&1 || true
+        echo "Starting Minikube (Kubernetes ${ver}) with GPU flags..." >&2
+        if ! minikube start -p "${MINIKUBE_PROFILE}" --driver=docker --container-runtime=docker --gpus=all --kubernetes-version=${ver} --addons=nvidia-device-plugin --extra-config=kubelet.cgroup-driver=${HOST_CGROUP_DRIVER}; then
+          echo "Start failed for ${ver}; trying next if available." >&2
+          continue
+        fi
+        echo "Waiting briefly for device plugin pods..." >&2
+        for j in {1..20}; do
+          if kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running; then break; fi
+          sleep 4
+        done
+        if kubectl describe node ${MINIKUBE_PROFILE} | grep -q 'nvidia.com/gpu'; then
+          echo "SUCCESS: GPU resource visible on ${ver}." >&2
+          break
+        else
+          echo "GPU still not visible on ${ver}." >&2
+        fi
+      done
+    else
+      echo "Proceeding without GPU resource yet (deploy may Pending). Set GPU_VERSION_FALLBACK=1 to enable destructive fallback attempts." >&2
+    fi
+  fi
   if ! kubectl describe node ${MINIKUBE_PROFILE} | grep -q 'nvidia.com/gpu'; then
     echo "ERROR: GPU resource not advertised after fallback attempts." >&2
     echo "Troubleshoot steps:" >&2
@@ -317,3 +370,39 @@ kubectl get pods -n ${NAMESPACE} -l app=chat-app -o wide
 echo "Deployment complete. Quick test commands:"
 echo "kubectl port-forward -n chat svc/chat-app 8080:8080 &" 
 echo "curl -s localhost:8080/healthz | jq || curl -s localhost:8080/healthz"
+
+# --- Post-deploy profiler sanity check ---
+SKIP_PROFILE_SANITY=${SKIP_PROFILE_SANITY:-0}
+if [ "${SKIP_PROFILE_SANITY}" != "1" ]; then
+  echo "Running profiler sanity check (set SKIP_PROFILE_SANITY=1 to skip)..." >&2
+  # Select newest running pod
+  POD=$(kubectl -n ${NAMESPACE} get pods -l app=chat-app -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.creationTimestamp}{" "}{.metadata.name}{"\n"}{end}' | sort | tail -n1 | awk '{print $2}')
+  if [ -z "${POD}" ]; then
+    echo "Profiler sanity: no running pod found; skipping." >&2
+  else
+    echo "Profiler sanity: targeting pod ${POD}" >&2
+    # Wait for /healthz readiness (HTTP 200) up to 30s via exec curl inside container
+    for i in {1..15}; do
+      if kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/healthz" 2>/dev/null | grep -q '^200$'; then
+        break
+      fi
+      sleep 2
+    done
+    # Issue profiling request
+    PROF_TRACE=$(kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c "curl -s -X POST 'http://localhost:8080/chat?profile=true' -H 'Content-Type: application/json' -d '{\"message\":\"profiler sanity\"}' | jq -r .profile_trace 2>/dev/null || true")
+    if [ -z "${PROF_TRACE}" ] || echo "${PROF_TRACE}" | grep -qi 'error:'; then
+      echo "Profiler sanity: profiling failed or returned error: ${PROF_TRACE}" >&2
+    else
+      echo "Profiler sanity: profile_trace reported: ${PROF_TRACE}" >&2
+      # Check file existence (inside container)
+      if kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c "test -f ${PROF_TRACE} || test -f ${PROF_TRACE}.gz"; then
+        echo "Profiler sanity: trace file exists." >&2
+        kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c "ls -lt $(dirname ${PROF_TRACE}) | head" >&2 || true
+      else
+        echo "Profiler sanity: trace file not found inside container." >&2
+      fi
+    fi
+  fi
+else
+  echo "Skipping profiler sanity check (SKIP_PROFILE_SANITY=1)." >&2
+fi
