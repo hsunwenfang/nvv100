@@ -8,6 +8,7 @@ import threading
 import queue
 
 import torch
+from torch.profiler import record_function  # lightweight span tagging (no heavy import cost when unused)
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
@@ -68,16 +69,17 @@ def _batch_worker():
                 batch.append(nxt)
             except queue.Empty:
                 break
-        # Run generation in a loop (still per item) but under single model fetch to reduce overhead
         m = get_model()
         batch_start = time.time()
-        for item in batch:
-            try:
-                item.output = m.generate(item.prompt, max_new_tokens=item.max_new_tokens)
-            except Exception as e:  # noqa: BLE001
-                item.error = str(e)
-            finally:
-                item.event.set()
+        with record_function("batch.generate"):
+            for item in batch:
+                try:
+                    with record_function("item.generate"):
+                        item.output = m.generate(item.prompt, max_new_tokens=item.max_new_tokens)
+                except Exception as e:  # noqa: BLE001
+                    item.error = str(e)
+                finally:
+                    item.event.set()
         batch_time = time.time() - batch_start
         try:
             avg = batch_time / max(len(batch), 1)
@@ -87,7 +89,7 @@ def _batch_worker():
             "batch processed size=%d total_time=%.3fs avg_per_item=%.3fs window=%.3f max_size=%d",
             len(batch), batch_time, avg, BATCH_MAX_DELAY_SEC, BATCH_MAX_SIZE,
         )
-    _record_batch(len(batch))
+        _record_batch(len(batch))  # now reachable each loop
 
 _metrics = {"batches": 0, "total_batch_items": 0}
 
@@ -111,18 +113,19 @@ def chat(body: ChatRequest, profile: bool = Query(False)):
     max_new_tokens = body.max_new_tokens or int(os.getenv("MAX_NEW_TOKENS", "128"))
     start = time.time()
     prof_path = None
+    summary_path = None
     if profile:
         prof_dir = Path("profiles/torch")
         prof_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
-        trace_file = prof_dir / f"trace_{ts}.json"
+        base_name = f"trace_{ts}"
+        trace_file = prof_dir / f"{base_name}.json"
         try:
             from torch.profiler import profile, ProfilerActivity
             activities = [ProfilerActivity.CPU]
             if torch.cuda.is_available():
                 activities.append(ProfilerActivity.CUDA)
-            # Include Python stacks & module hierarchy so Perfetto shows originating Python lines
-            # (Adds overhead; enabled only when profile=true)
+            # Always capture rich detail for a single request profile
             with profile(
                 activities=activities,
                 record_shapes=True,
@@ -130,14 +133,38 @@ def chat(body: ChatRequest, profile: bool = Query(False)):
                 with_stack=True,
                 with_modules=True,
             ) as prof:
-                # Use batching path inside profile too
-                item = _BatchItem(body.message, max_new_tokens)
-                BATCH_QUEUE.put(item)
-                item.event.wait()
+                with record_function("request.enqueue"):
+                    item = _BatchItem(body.message, max_new_tokens)
+                    BATCH_QUEUE.put(item)
+                    item.event.wait()
                 if item.error:
                     raise RuntimeError(item.error)
                 output = item.output or ""
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
             prof.export_chrome_trace(str(trace_file))
+            # Write a focused summary (top 40 ops by CUDA time if available else CPU time)
+            try:
+                ka = prof.key_averages()
+                has_cuda = any(getattr(e, 'self_cuda_time_total', 0) for e in ka)
+                sort_key = "cuda_time_total" if has_cuda else "cpu_time_total"
+                table = ka.table(sort_by=sort_key, row_limit=40)
+                summary_file = prof_dir / f"{base_name}_summary.txt"
+                summary_file.write_text(table)
+                summary_path = str(summary_file)
+            except Exception:
+                logger.exception("Failed to write profiler summary")
+            # Always gzip to keep size manageable
+            try:
+                import gzip, shutil
+                gz_path = trace_file.with_suffix(trace_file.suffix + ".gz")
+                with open(trace_file, "rb") as fin, gzip.open(gz_path, "wb", compresslevel=5) as fout:
+                    shutil.copyfileobj(fin, fout)
+                # Remove original to save space
+                trace_file.unlink(missing_ok=True)
+                trace_file = gz_path  # type: ignore[assignment]
+            except Exception:
+                logger.exception("Failed gzip of trace")
             prof_path = str(trace_file)
         except Exception as e:
             logger.exception("profiling failed")
@@ -156,7 +183,7 @@ def chat(body: ChatRequest, profile: bool = Query(False)):
             return JSONResponse(status_code=500, content={"error": item.error})
         output = item.output or ""
     latency = time.time() - start
-    return {"response": output, "latency_sec": round(latency, 4), "profile_trace": prof_path}
+    return {"response": output, "latency_sec": round(latency, 4), "profile_trace": prof_path, "profile_summary": summary_path}
 
 
 @app.get("/")

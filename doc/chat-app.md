@@ -11,5 +11,5 @@ POST /chat HTTP/1.1
 Host: localhost:8080
 Content-Type: application/json
 
-{"message":"Found me 100000 vegan restaurants in Tokyo"}
+{"message":"Found me 100000 vegan restaurants in Tokyo and write recommendation messages about them"}
 ```

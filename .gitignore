@@ -1,4 +1,8 @@
-# Byte-compiled / optimized / DLL files
+
+.deploy/
+profiles/
+
+# Byte-coFound me 100000 vegan restaurants in Tokyo in googlemap.com and give me their lat and long coordinates.mpiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class

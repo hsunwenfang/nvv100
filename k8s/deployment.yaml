@@ -25,6 +25,9 @@ spec:
         - name: chat-app
           image: chat-app:latest
           imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - name: profiler-traces
+              mountPath: /app/profiles/torch
           envFrom:
             - secretRef:
                 name: hf-token
@@ -52,3 +55,8 @@ spec:
           resources:
             limits:
               nvidia.com/gpu: 1
+      volumes:
+        - name: profiler-traces
+          hostPath:
+            path: /home/azureuser/nvv100/profiles/torch
+            type: DirectoryOrCreate

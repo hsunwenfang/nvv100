@@ -1,0 +1,18 @@
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-pip git curl ca-certificates jq procps sysstat \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Base (heavy) dependencies: current requirements.txt pinned set
+COPY requirements.txt ./requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Image metadata label for traceability
+LABEL org.opencontainers.image.title="chat-app-base" \
+      org.opencontainers.image.description="Base image with CUDA runtime and core Python dependencies" \
+      org.opencontainers.image.source="https://github.com/hsunwenfang/nvv100"

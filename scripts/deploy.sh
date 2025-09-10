@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Allow defining a shell kubectl shim if kubectl binary absent (use minikube's embedded kubectl)
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl not found in PATH; using 'minikube kubectl --' shim" >&2
+  kubectl() { minikube kubectl -- "$@"; }
+fi
+
 # Require docker usable without sudo
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: docker not accessible (permission denied). Fix by adding user to docker group or adjusting /var/run/docker.sock perms." >&2
@@ -8,6 +14,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 IMAGE_NAME="chat-app:latest"
+AUTO_TAG=1
 FRESH=0
 CPU_COUNT=""
 MEMORY_SIZE=""
@@ -27,7 +34,8 @@ while [[ $# -gt 0 ]]; do
     --memory) MEMORY_SIZE="$2"; shift 2 ;;
     --no-addon) NO_ADDON=1; shift ;;
     --k8s-version) K8S_VERSION="$2"; shift 2 ;;
-    --image-name) IMAGE_NAME="$2"; shift 2 ;;
+  --image-name) IMAGE_NAME="$2"; AUTO_TAG=0; shift 2 ;;
+  --no-auto-tag) AUTO_TAG=0; shift ;;
     -h|--help) usage ;;
     *) echo "Unknown arg: $1" >&2; usage ;;
   esac
@@ -59,11 +67,11 @@ fi
 
 wait_for_apiserver() {
   echo "Waiting for Kubernetes apiserver to answer..."
-  local tries=30
-  local sleep_s=6
+  local tries=40
+  local sleep_s=5
   local i
   for i in $(seq 1 $tries); do
-    if kubectl version >/dev/null 2>&1; then
+    if kubectl version --short >/dev/null 2>&1 || kubectl get nodes >/dev/null 2>&1; then
       echo "Apiserver is reachable."; return 0
     fi
     sleep $sleep_s
@@ -92,6 +100,32 @@ if ! minikube status -p "${MINIKUBE_PROFILE}" >/dev/null 2>&1; then
   fi
 else
   echo "Minikube already running. Skipping start.";
+  if (( ! FRESH )); then
+    echo "Checking existing cluster GPU readiness (device, plugin pod, resource)..."
+    attempts=0
+    max_attempts=25   # ~100s (25 * 4s) graceful wait before deciding restart
+    while :; do
+      GPU_DEVICE_OK=0; PLUGIN_OK=0; RESOURCE_OK=0
+      if minikube ssh -p "${MINIKUBE_PROFILE}" -- 'ls /dev/nvidia0 >/dev/null 2>&1'; then GPU_DEVICE_OK=1; fi
+      if kubectl get pods -A -l k8s-app=nvidia-device-plugin 2>/dev/null | grep -q Running; then PLUGIN_OK=1; fi
+      if kubectl describe node ${MINIKUBE_PROFILE} 2>/dev/null | grep -q 'nvidia.com/gpu'; then RESOURCE_OK=1; fi
+      if (( GPU_DEVICE_OK && PLUGIN_OK && RESOURCE_OK )); then
+        echo "Cluster already GPU ready; no restart needed."; break
+      fi
+      if (( attempts >= max_attempts )); then
+        echo "Existing cluster NOT fully GPU ready after wait (device:${GPU_DEVICE_OK} plugin:${PLUGIN_OK} resource:${RESOURCE_OK}). Restarting..." >&2
+        minikube delete -p "${MINIKUBE_PROFILE}" || true
+        echo "Starting Minikube with GPU flags: ${START_FLAGS}" 
+        if ! minikube start -p "${MINIKUBE_PROFILE}" ${START_FLAGS}; then
+          echo "ERROR: minikube start failed after restart attempt." >&2
+          exit 1
+        fi
+        break
+      fi
+      attempts=$((attempts+1))
+      sleep 4
+    done
+  fi
 fi
 
 echo "Verifying apiserver health before GPU checks..."
@@ -195,24 +229,54 @@ if ! kubectl describe node ${MINIKUBE_PROFILE} | grep -q 'nvidia.com/gpu'; then
 fi
 echo "Node GPU resource present." 
 
-echo "[5/6] Building image inside Minikube docker daemon (docker-env enforced)..."
+echo "[5/6] Building images (base + app) with auto-tag logic inside Minikube docker daemon..."
 eval "$(minikube -p ${MINIKUBE_PROFILE} docker-env)"
-docker build -t ${IMAGE_NAME} .
 
-echo "Verifying image presence in Minikube daemon..."
-eval "$(minikube -p ${MINIKUBE_PROFILE} docker-env)"
-if ! docker images | awk '{print $1":"$2}' | grep -q "^${IMAGE_NAME}$"; then
-  echo "ERROR: Image ${IMAGE_NAME} not found in Minikube docker daemon after build." >&2
-  exit 1
+# Determine hashes
+if (( AUTO_TAG )); then
+  BASE_HASH=$( (sha256sum Dockerfile.base requirements.txt 2>/dev/null; ) | sha256sum | cut -c1-12 || echo baseunknown)
+  APP_HASH=$( (find app -type f -name '*.py' -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null; sha256sum Dockerfile.app requirements_app.txt k8s/deployment.yaml 2>/dev/null ) | sha256sum | cut -c1-12 || echo appunknown)
+  BASE_IMAGE="chat-app-base:${BASE_HASH}"
+  IMAGE_NAME="chat-app:${APP_HASH}"
+  echo "Computed BASE_HASH=${BASE_HASH} APP_HASH=${APP_HASH}" >&2
+else
+  BASE_IMAGE="chat-app-base:latest"
 fi
+
+# Build base if needed
+if ! docker images | awk '{print $1":"$2}' | grep -q "^${BASE_IMAGE}$"; then
+  echo "Building base image ${BASE_IMAGE}..." >&2
+  docker build -f Dockerfile.base -t ${BASE_IMAGE} .
+  # No 'latest' tagging when AUTO_TAG enabled (keep hash-only tagging)
+else
+  echo "Base image ${BASE_IMAGE} already present (cache hit)." >&2
+fi
+
+# Build app image if needed
+if ! docker images | awk '{print $1":"$2}' | grep -q "^${IMAGE_NAME}$"; then
+  echo "Building app image ${IMAGE_NAME} (FROM ${BASE_IMAGE})..." >&2
+  docker build -f Dockerfile.app --build-arg BASE_IMAGE=${BASE_IMAGE} -t ${IMAGE_NAME} .
+  # No 'latest' tagging when AUTO_TAG enabled (keep hash-only tagging)
+else
+  echo "App image ${IMAGE_NAME} already present (cache hit)." >&2
+fi
+
+# Remove any stale 'latest' tags to keep only hash tags (non-fatal if absent)
+if (( AUTO_TAG )); then
+  docker rmi chat-app:latest chat-app-base:latest 2>/dev/null || true
+fi
+
+mkdir -p .deploy 2>/dev/null || true
+echo "${IMAGE_NAME}" > .deploy/last_image_tag
+echo "Last app image tag stored in .deploy/last_image_tag" >&2
 
 NAMESPACE=${NAMESPACE:-chat}
 echo "[6/6] Deploying and waiting for application pod in namespace '${NAMESPACE}'..."
 kubectl get namespace ${NAMESPACE} >/dev/null 2>&1 || kubectl create namespace ${NAMESPACE}
 
-HF_TOKEN=$HF_TOKEN
+HF_TOKEN="${HF_TOKEN:-}"
 # Optional Hugging Face token secret creation (idempotent)
-if [ -n "${HF_TOKEN:-}" ]; then
+if [ -n "${HF_TOKEN}" ]; then
   echo "Creating/Updating hf-token secret for Hugging Face auth..."
   kubectl create secret generic hf-token -n ${NAMESPACE} \
     --from-literal=HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}" \
