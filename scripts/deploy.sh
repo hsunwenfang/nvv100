@@ -406,29 +406,34 @@ if [ "${SKIP_PROFILE_SANITY}" != "1" ]; then
             set -euo pipefail
             cd '"${TRACE_DIR}"' 2>/dev/null || exit 0
             # Compress any raw trace_*.json not yet gzipped
+            COMP_METHOD=${TRACE_RECOMPRESS:-gzip9}
             for f in trace_*.json; do
               [ -f "$f" ] || continue
               [ -f "$f.gz" ] && continue
-              gzip -c "$f" > "$f.gz" && rm -f "$f" || true
+              if [ "$COMP_METHOD" = "xz" ] && command -v xz >/dev/null 2>&1; then
+                xz -T1 -9 -c "$f" > "$f.xz" && rm -f "$f" || true
+              else
+                gzip -9 -c "$f" > "$f.gz" && rm -f "$f" || true
+              fi
             done
             # Remove non trace_*.json.gz profiler artifacts (e.g., pt.trace.json, summaries, tar archives)
             for f in *; do
               [ -f "$f" ] || continue
               case "$f" in
-                trace_*.json.gz) ;; # keep candidates for pruning in next step
+                trace_*.json.gz|trace_*.json.xz) ;; # keep candidates
                 *) rm -f -- "$f" || true ;;
               esac
             done
             # Prune older gz beyond retention count
             count=0
-            for f in $(ls -1t trace_*.json.gz 2>/dev/null); do
+            for f in $(ls -1t trace_*.json.gz trace_*.json.xz 2>/dev/null); do
               count=$((count+1))
               if [ $count -gt '"${RETAIN}"' ]; then
                 rm -f -- "$f" || true
               fi
             done
             echo "Remaining traces:" >&2
-            ls -1lt trace_*.json.gz 2>/dev/null | head -n 10 >&2 || true
+            ls -1lt trace_*.json.gz trace_*.json.xz 2>/dev/null | head -n 10 >&2 || true
           ' || true
       else
         echo "Profiler sanity: trace file not found inside container." >&2

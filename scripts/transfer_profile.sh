@@ -51,9 +51,16 @@ TRACE_FILES=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE
 if [[ -z ${TRACE_FILES} ]]; then
   RAW_LIST=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
   if [[ -n ${RAW_LIST} ]]; then
-    log "No compressed traces; gzipping raw traces inside pod"
-    kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "set -e; for f in ${TRACE_DIR_IN_POD}/trace_*.json; do [ -f \"$f\" ] || continue; gzip -c \"$f\" > \"$f.gz\" && rm -f \"$f\"; done" || true
-    TRACE_FILES=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
+    COMP_METHOD=${TRACE_RECOMPRESS:-gzip9}
+    log "No compressed traces; compressing raw traces inside pod using ${COMP_METHOD}"
+    if [[ "${COMP_METHOD}" == "xz" ]]; then
+      kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "set -e; command -v xz >/dev/null 2>&1 || exit 0; for f in ${TRACE_DIR_IN_POD}/trace_*.json; do [ -f \"$f\" ] || continue; xz -T1 -9 -c \"$f\" > \"$f.xz\" && rm -f \"$f\"; done" || true
+      TRACE_FILES=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.xz 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
+    fi
+    if [[ -z ${TRACE_FILES} ]]; then
+      kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "set -e; for f in ${TRACE_DIR_IN_POD}/trace_*.json; do [ -f \"$f\" ] || continue; gzip -9 -c \"$f\" > \"$f.gz\" && rm -f \"$f\"; done" || true
+      TRACE_FILES=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
+    fi
   fi
 fi
 [[ -z ${TRACE_FILES} ]] && err "No trace_*.json(.gz) files found in pod ${POD}"
