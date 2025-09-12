@@ -398,6 +398,38 @@ if [ "${SKIP_PROFILE_SANITY}" != "1" ]; then
       if kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c "test -f ${PROF_TRACE} || test -f ${PROF_TRACE}.gz"; then
         echo "Profiler sanity: trace file exists." >&2
         kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c "ls -lt $(dirname ${PROF_TRACE}) | head" >&2 || true
+          # Retention / cleanup: keep only latest N compressed trace_*.json.gz (default 3)
+          RETAIN=${PROFILE_TRACE_RETAIN:-3}
+          TRACE_DIR=$(dirname "${PROF_TRACE}")
+          echo "Profiler cleanup: retaining latest ${RETAIN} trace_*.json.gz and removing older + non-matching artifacts" >&2
+          kubectl -n ${NAMESPACE} exec "${POD}" -- bash -c '
+            set -euo pipefail
+            cd '"${TRACE_DIR}"' 2>/dev/null || exit 0
+            # Compress any raw trace_*.json not yet gzipped
+            for f in trace_*.json; do
+              [ -f "$f" ] || continue
+              [ -f "$f.gz" ] && continue
+              gzip -c "$f" > "$f.gz" && rm -f "$f" || true
+            done
+            # Remove non trace_*.json.gz profiler artifacts (e.g., pt.trace.json, summaries, tar archives)
+            for f in *; do
+              [ -f "$f" ] || continue
+              case "$f" in
+                trace_*.json.gz) ;; # keep candidates for pruning in next step
+                *) rm -f -- "$f" || true ;;
+              esac
+            done
+            # Prune older gz beyond retention count
+            count=0
+            for f in $(ls -1t trace_*.json.gz 2>/dev/null); do
+              count=$((count+1))
+              if [ $count -gt '"${RETAIN}"' ]; then
+                rm -f -- "$f" || true
+              fi
+            done
+            echo "Remaining traces:" >&2
+            ls -1lt trace_*.json.gz 2>/dev/null | head -n 10 >&2 || true
+          ' || true
       else
         echo "Profiler sanity: trace file not found inside container." >&2
       fi

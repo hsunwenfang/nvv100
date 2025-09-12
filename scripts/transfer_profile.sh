@@ -40,39 +40,49 @@ POD=$(kubectl -n "${NAMESPACE}" get pods -l app=chat-app -o jsonpath='{range .it
 
 log "Selected newest running pod: ${POD}"
 
-# List all gz trace files with modification time
-log "Listing trace *.json.gz files (if any) in ${POD}:${TRACE_DIR_IN_POD}" 
-LIST_CMD=(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -ltr ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null || true")
-${LIST_CMD[@]} >&2 || true
+# List trace files (.json.gz preferred, fall back to raw .json)
+log "Listing trace artifacts in ${POD}:${TRACE_DIR_IN_POD}" 
+kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -ltr ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null || true" >&2 || true
+kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -ltr ${TRACE_DIR_IN_POD}/trace_*.json 2>/dev/null | grep -v '.json.gz' || true" >&2 || true
 
-# Determine newest (most recently modified) trace file path
-TRACE_FILE=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n1") || true
-[[ -z ${TRACE_FILE} ]] && err "No trace_*.json.gz files found in pod ${POD}"
-TRACE_BASENAME=$(basename "${TRACE_FILE}")
+# Determine list of latest traces to copy (default 3). If none gzipped, gzip raws then re-list.
+TRACE_COPY_COUNT=${TRACE_COPY_COUNT:-3}
+TRACE_FILES=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
+if [[ -z ${TRACE_FILES} ]]; then
+  RAW_LIST=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
+  if [[ -n ${RAW_LIST} ]]; then
+    log "No compressed traces; gzipping raw traces inside pod"
+    kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "set -e; for f in ${TRACE_DIR_IN_POD}/trace_*.json; do [ -f \"$f\" ] || continue; gzip -c \"$f\" > \"$f.gz\" && rm -f \"$f\"; done" || true
+    TRACE_FILES=$(kubectl -n "${NAMESPACE}" exec "${POD}" -- bash -c "ls -1t ${TRACE_DIR_IN_POD}/trace_*.json.gz 2>/dev/null | head -n ${TRACE_COPY_COUNT}") || true
+  fi
+fi
+[[ -z ${TRACE_FILES} ]] && err "No trace_*.json(.gz) files found in pod ${POD}"
 
 mkdir -p "${LOCAL_DIR}"
-LOCAL_PATH="${LOCAL_DIR}/${TRACE_BASENAME}"
-
-log "Latest trace file: ${TRACE_FILE}"
-log "Copying to: ${LOCAL_PATH}"
-
-if [[ ${DRY_RUN} != 1 ]]; then
-  kubectl -n "${NAMESPACE}" cp "${POD}:${TRACE_FILE}" "${LOCAL_PATH}" || err "kubectl cp failed"
-else
-  log "DRY_RUN=1; skipping copy"
+log "Copying up to ${TRACE_COPY_COUNT} traces to ${LOCAL_DIR}" 
+if [[ ${DRY_RUN} == 1 ]]; then
+  echo "${TRACE_FILES}" | sed 's/^/[transfer_profile] DRY_RUN would copy: /' >&2
   exit 0
 fi
 
-[[ ! -s ${LOCAL_PATH} ]] && err "Local file missing or empty after copy: ${LOCAL_PATH}"
-
-if [[ ${DECOMPRESS} == 1 ]]; then
-  if command -v gunzip >/dev/null 2>&1; then
-    cp "${LOCAL_PATH}" "${LOCAL_PATH}.bak"
-    gunzip -k "${LOCAL_PATH}" || log "gunzip failed (continuing)"
-  else
-    log "gunzip not available; skipping decompression"
+copied=0
+while IFS= read -r TRACE_FILE; do
+  [[ -z ${TRACE_FILE} ]] && continue
+  BASENAME=$(basename "${TRACE_FILE}")
+  DEST="${LOCAL_DIR}/${BASENAME}"
+  log "Copying ${TRACE_FILE} -> ${DEST}"
+  kubectl -n "${NAMESPACE}" cp "${POD}:${TRACE_FILE}" "${DEST}" || err "kubectl cp failed for ${TRACE_FILE}"
+  [[ ! -s ${DEST} ]] && err "Copied file empty: ${DEST}"
+  if [[ ${DECOMPRESS} == 1 ]]; then
+    if command -v gunzip >/dev/null 2>&1; then
+      cp "${DEST}" "${DEST}.bak"
+      gunzip -k "${DEST}" || log "gunzip failed (continuing)"
+    else
+      log "gunzip not available; skipping decompression for ${BASENAME}"
+    fi
   fi
-fi
+  copied=$((copied+1))
+done < <(echo "${TRACE_FILES}")
 
-log "Done."
+log "Done. Copied ${copied} trace file(s)."
 
