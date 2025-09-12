@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config-all
+  namespace: gpu-operator
+  labels:
+    app: nvidia-gpu-operator
+    purpose: gpu-time-slicing
+# Cluster-wide default: oversubscribe each physical GPU into 5 time-sliced replicas.
+# Using 5 so the verification Deployment with 5 pods can all schedule on a single-GPU node.
+# Adjust replicas as needed (e.g., 2,4,8). Higher numbers increase context switch overhead.
+data:
+  any: |-
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        renameByDefault: false
+        failRequestsGreaterThanOne: false
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 5

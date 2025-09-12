@@ -1,8 +1,8 @@
 
 - Pod spec requests GPUs: container.resources.limits (and usually requests) includes nvidia.com/gpu: <N>. (Must be >0; for device plugins limits==requests enforced by kubelet).
 - Scheduler picks a node advertising sufficient allocatable nvidia.com/gpu (from device plugin’s ListAndWatch stream to kubelet).
-Kubelet sees a pod with a device plugin resource. For each container it calculates needed count and asks its Device Manager to allocate.
-Device Manager calls the device plugin’s Allocate RPC, passing the list of device IDs it tentatively selected.
+- Kubelet sees a pod with a device plugin resource. For each container it calculates needed count and asks its Device Manager to allocate.
+- Device Manager calls the device plugin’s Allocate RPC, passing the list of device IDs it tentatively selected.
 NVIDIA device plugin chooses concrete devices (or MIG instances), and returns an AllocateResponse containing:
 DeviceSpecs (host device paths like /dev/nvidia0, /dev/nvidiactl, /dev/nvidia-uvm etc.)
 Mounts (host library directories or driver bundles) OR (in newer versions) CDI device references instead of raw mounts.

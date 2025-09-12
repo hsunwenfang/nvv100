@@ -135,7 +135,9 @@ def chat(body: ChatRequest, profile: bool = Query(False)):
         if item.error:
             return JSONResponse(status_code=500, content={"error": item.error})
         latency = time.time() - start
-        return {"response": item.output, "latency_sec": round(latency, 4)}
+        # include model metadata (required by tests) without re-loading if already loaded
+        meta = get_model().meta
+        return {"response": item.output, "latency_sec": round(latency, 4), "model": meta}
 
     # Profiling path (single request)
     prof_dir = Path("profiles/torch")
@@ -223,6 +225,7 @@ def chat(body: ChatRequest, profile: bool = Query(False)):
         "profile_trace": prof_path,
         "profile_summary": summary_path,
         "profiler_fallback": used_fallback,
+        "model": model.meta,
     }
 
 

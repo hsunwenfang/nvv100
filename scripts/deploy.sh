@@ -49,7 +49,7 @@ K8S_VERSION=${K8S_VERSION:-"v1.31.0"}
 HOST_CGROUP_DRIVER=$(docker info --format '{{.CgroupDriver}}' 2>/dev/null || echo cgroupfs)
 
 # Explicit GPU start: minimal stable flags (feature-gate no longer needed on modern k8s)
-START_FLAGS=${START_FLAGS:-"--driver=docker --container-runtime=docker --gpus=all --kubernetes-version=${K8S_VERSION}"}
+START_FLAGS=${START_FLAGS:-"--driver=docker --container-runtime=docker --gpus=all --kubernetes-version=${K8S_VERSION} --extra-config=kubelet.v=6"}
 [[ -n "$CPU_COUNT" ]] && START_FLAGS+=" --cpus=${CPU_COUNT}"
 [[ -n "$MEMORY_SIZE" ]] && START_FLAGS+=" --memory=${MEMORY_SIZE}"
 
